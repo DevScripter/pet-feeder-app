@@ -1,0 +1,557 @@
+import React, { useState, useEffect, useCallback } from 'react';
+
+// Firebase imports
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, serverTimestamp, getDoc } from 'firebase/firestore';
+
+// Main App component
+const App = () => {
+  // State variables for Firebase and app data
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [pets, setPets] = useState([]); // List of all pets in the group
+  const [selectedPetId, setSelectedPetId] = useState(null); // The currently active pet
+  const [lastFedInfo, setLastFedInfo] = useState(null);
+  const [reminders, setReminders] = useState([]);
+  const [newReminderTime, setNewReminderTime] = useState('');
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [userName, setUserName] = useState('');
+  const [newUserName, setNewUserName] = useState('');
+  const [newPetName, setNewPetName] = useState(''); // State for the new pet name input
+  const [appId, setAppId] = useState(''); // This is the user-chosen group ID now
+  const [inputAppId, setInputAppId] = useState('');
+  const [newAppId, setNewAppId] = useState('');
+  const [fedHistoryDates, setFedHistoryDates] = useState(new Set());
+  const [isJoined, setIsJoined] = useState(false);
+  const [isJoiningOrCreating, setIsJoiningOrCreating] = useState(false); // New state to manage loading
+
+  // Get the global app ID, which is the main folder for the app in the database
+  const globalAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+  // Function to show a simple message box instead of toast notifications
+  const showMessage = useCallback((message) => {
+    console.log(message);
+  }, []);
+
+  // Initialize Firebase and set up authentication
+  useEffect(() => {
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setIsAuthReady(true);
+        } else {
+          if (typeof __initial_auth_token !== 'undefined') {
+            await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+          } else {
+            await signInAnonymously(firebaseAuth);
+          }
+        }
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error('Error initializing Firebase:', e);
+      showMessage('Error initializing the app. Please try again.');
+    }
+  }, [showMessage]);
+
+  // Main data listener for all pets within the selected group
+  useEffect(() => {
+    if (!db || !isAuthReady || !isJoined || !appId) return;
+
+    // Get the user's display name from the database, using the global app ID
+    const fetchUserName = async () => {
+      const userDocRef = doc(db, 'artifacts', globalAppId, 'users', userId);
+      const userDocSnap = await getDoc(userDocRef);
+      if (userDocSnap.exists()) {
+        const name = userDocSnap.data().name;
+        setUserName(name);
+        setNewUserName(name);
+      }
+    };
+    fetchUserName();
+
+    // Listen for changes to the list of pets in the selected group
+    const petsRef = collection(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets');
+    const unsubscribePets = onSnapshot(petsRef, (snapshot) => {
+      const petsList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        name: doc.id, // The pet's name is the document ID for simplicity
+      }));
+      setPets(petsList);
+      // Automatically select the first pet if none is selected
+      if (petsList.length > 0 && !selectedPetId) {
+        setSelectedPetId(petsList[0].id);
+      }
+    }, (error) => {
+      console.error("Error fetching pets:", error);
+    });
+
+    return () => unsubscribePets();
+  }, [db, isAuthReady, isJoined, appId, userId, selectedPetId, globalAppId]);
+
+  // Listener for the data of the currently selected pet
+  useEffect(() => {
+    if (!db || !isAuthReady || !isJoined || !appId || !selectedPetId) return;
+
+    // Listen for changes to the last fed information
+    const lastFedRef = doc(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', selectedPetId, 'status', 'lastFed');
+    const unsubscribeFed = onSnapshot(lastFedRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setLastFedInfo(data);
+      } else {
+        setLastFedInfo(null);
+      }
+    }, (error) => {
+      console.error("Error fetching last fed info:", error);
+    });
+
+    // Listen for changes to the reminders
+    const remindersRef = collection(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', selectedPetId, 'reminders');
+    const q = query(remindersRef);
+    const unsubscribeReminders = onSnapshot(q, (snapshot) => {
+      const remindersList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      remindersList.sort((a, b) => a.time.localeCompare(b.time));
+      setReminders(remindersList);
+    }, (error) => {
+      console.error("Error fetching reminders:", error);
+    });
+    
+    // Listen for changes to the fed history
+    const fedHistoryColRef = collection(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', selectedPetId, 'fedHistory');
+    const unsubscribeHistory = onSnapshot(fedHistoryColRef, (snapshot) => {
+      const dates = new Set();
+      snapshot.docs.forEach(doc => {
+        const timestamp = doc.data().timestamp;
+        if (timestamp) {
+          const date = timestamp.toDate();
+          dates.add(date.toISOString().split('T')[0]);
+        }
+      });
+      setFedHistoryDates(dates);
+    }, (error) => {
+      console.error("Error fetching fed history:", error);
+    });
+
+    return () => {
+      unsubscribeFed();
+      unsubscribeReminders();
+      unsubscribeHistory();
+    };
+  }, [db, isAuthReady, isJoined, appId, selectedPetId, globalAppId]);
+
+  // Handle "Set My Name" button click
+  const handleSetUserName = async () => {
+    if (!db || !userId || !newUserName.trim()) {
+      showMessage('Please enter a valid name.');
+      return;
+    }
+    try {
+      const userDocRef = doc(db, 'artifacts', globalAppId, 'users', userId);
+      await setDoc(userDocRef, { name: newUserName.trim() });
+      setUserName(newUserName.trim());
+      showMessage('Username updated successfully!');
+    } catch (e) {
+      console.error('Error setting username:', e);
+      showMessage('Failed to set username.');
+    }
+  };
+
+  // Handle "Pet Fed" button click
+  const handlePetFed = async () => {
+    if (!db || !userId || !appId || !userName || !selectedPetId) {
+      showMessage('Please wait for the app to connect and select a pet.');
+      return;
+    }
+
+    try {
+      const lastFedRef = doc(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', selectedPetId, 'status', 'lastFed');
+      await setDoc(lastFedRef, {
+        timestamp: serverTimestamp(),
+        feederId: userId,
+        feederName: userName,
+      });
+
+      const fedHistoryRef = collection(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', selectedPetId, 'fedHistory');
+      await addDoc(fedHistoryRef, {
+        timestamp: serverTimestamp(),
+        feederId: userId,
+        feederName: userName,
+      });
+    } catch (e) {
+      console.error('Error marking pet as fed:', e);
+      showMessage('Failed to mark pet as fed.');
+    }
+  };
+
+  // Handle "Add Reminder" button click
+  const handleAddReminder = async () => {
+    if (!db || !newReminderTime || !userId || !appId || !selectedPetId) {
+      showMessage('Please enter a time and ensure a pet is selected.');
+      return;
+    }
+
+    try {
+      const remindersRef = collection(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', selectedPetId, 'reminders');
+      await addDoc(remindersRef, {
+        time: newReminderTime,
+        creatorId: userId,
+        createdAt: serverTimestamp(),
+      });
+      setNewReminderTime('');
+    } catch (e) {
+      console.error('Error adding reminder:', e);
+      showMessage('Failed to add reminder.');
+    }
+  };
+
+  // Handle "Add Pet" button click
+  const handleAddPet = async () => {
+    if (!db || !appId || !newPetName.trim()) {
+      showMessage('Please enter a valid pet name.');
+      return;
+    }
+    const petId = newPetName.trim().toLowerCase().replace(/[^a-z0-9]/g, '-');
+    try {
+      const petDocRef = doc(db, 'artifacts', globalAppId, 'public', 'data', 'groups', appId, 'pets', petId);
+      const petDocSnap = await getDoc(petDocRef);
+      if (petDocSnap.exists()) {
+        showMessage('A pet with this name already exists in this group.');
+      } else {
+        await setDoc(petDocRef, { name: newPetName.trim() });
+        setNewPetName('');
+        setSelectedPetId(petId);
+      }
+    } catch (e) {
+      console.error('Error adding new pet:', e);
+      showMessage('Failed to add new pet.');
+    }
+  };
+
+  // Handle "Join Group" button click
+  const handleJoinGroup = async () => {
+    if (inputAppId.trim()) {
+      setIsJoiningOrCreating(true);
+      const tempAppId = inputAppId.trim();
+      try {
+        const groupExistsDocRef = doc(db, 'artifacts', globalAppId, 'public', 'data', 'groups', tempAppId);
+        const docSnap = await getDoc(groupExistsDocRef);
+        if (docSnap.exists()) {
+          setAppId(tempAppId);
+          setIsJoined(true);
+        } else {
+          showMessage('Group ID not found. Please create it or check the ID.');
+        }
+      } catch (e) {
+        console.error("Error checking group existence:", e);
+        showMessage("Failed to join group due to an error.");
+      } finally {
+        setIsJoiningOrCreating(false);
+      }
+    } else {
+      showMessage('Please enter a valid group ID.');
+    }
+  };
+
+  // Handle "Create Group" button click
+  const handleCreateGroup = async () => {
+    if (newAppId.trim()) {
+      setIsJoiningOrCreating(true);
+      try {
+        const groupDocRef = doc(db, 'artifacts', globalAppId, 'public', 'data', 'groups', newAppId.trim());
+        const docSnap = await getDoc(groupDocRef);
+        if (docSnap.exists()) {
+          showMessage('A group with this ID already exists. Please choose a new ID or join the existing one.');
+        } else {
+          await setDoc(groupDocRef, { creatorId: userId, createdAt: serverTimestamp() });
+          setAppId(newAppId.trim());
+          setIsJoined(true);
+        }
+      } catch (e) {
+        console.error('Error creating new group:', e);
+        showMessage('Failed to create new group. Please try a different name.');
+      } finally {
+        setIsJoiningOrCreating(false);
+      }
+    } else {
+      showMessage('Please enter a name for the new group.');
+    }
+  };
+  
+  // Format the last fed timestamp to a readable string
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Never';
+    const date = timestamp.toDate();
+    return date.toLocaleString();
+  };
+  
+  // Generate calendar days for the current month
+  const today = new Date();
+  const year = today.getFullYear();
+  const month = today.getMonth();
+  const firstDayOfMonth = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  
+  const calendarDays = [];
+  // Add blank spots for the start of the month
+  for (let i = 0; i < firstDayOfMonth; i++) {
+    calendarDays.push({ day: null, fed: false });
+  }
+  // Add actual days
+  for (let i = 1; i <= daysInMonth; i++) {
+    const dateStr = new Date(year, month, i).toISOString().split('T')[0];
+    const isFed = fedHistoryDates.has(dateStr);
+    calendarDays.push({ day: i, fed: isFed });
+  }
+
+  // Show a loading screen if Firebase is not ready
+  if (!isAuthReady || isJoiningOrCreating) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-800 dark:text-gray-200">
+        <div className="text-xl font-semibold">Loading...</div>
+      </div>
+    );
+  }
+
+  // Show the "Join or Create Group" screen if not yet joined
+  if (!isJoined) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4 sm:p-6 bg-gray-100 dark:bg-gray-900 font-sans">
+        <div className="w-full max-w-sm bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-6 sm:p-8 space-y-6 text-center">
+          <h1 className="text-2xl sm:text-3xl font-extrabold text-blue-600 dark:text-blue-400">Join or Create a Pet Group</h1>
+          <p className="text-gray-500 dark:text-gray-400">Enter a group ID to join an existing one, or create your own!</p>
+          
+          {/* Join Group Section */}
+          <div className="space-y-4">
+            <h2 className="text-xl font-bold">Join an Existing Group</h2>
+            <input
+              type="text"
+              value={inputAppId}
+              onChange={(e) => setInputAppId(e.target.value)}
+              placeholder="Enter Group ID"
+              className="w-full p-3 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <button
+              onClick={handleJoinGroup}
+              className="w-full p-3 rounded-xl font-bold text-white transition-transform transform hover:scale-105 active:scale-95 duration-200"
+              style={{
+                background: 'linear-gradient(135deg, #3B82F6, #2563EB)',
+                boxShadow: '0 4px 15px rgba(59, 130, 246, 0.4)'
+              }}
+            >
+              Join Group
+            </button>
+          </div>
+          
+          <hr className="border-t border-gray-300 dark:border-gray-600 my-4" />
+          
+          {/* Create Group Section */}
+          <div className="space-y-4">
+            <h2 className="text-xl font-bold">Create a New Group</h2>
+            <input
+              type="text"
+              value={newAppId}
+              onChange={(e) => setNewAppId(e.target.value)}
+              placeholder="Choose a new Group ID"
+              className="w-full p-3 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <button
+              onClick={handleCreateGroup}
+              className="w-full p-3 rounded-xl font-bold text-white transition-transform transform hover:scale-105 active:scale-95 duration-200"
+              style={{
+                background: 'linear-gradient(135deg, #10B981, #059669)',
+                boxShadow: '0 4px 15px rgba(16, 185, 129, 0.4)'
+              }}
+            >
+              Create Group
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Main app dashboard
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center p-4 sm:p-6 bg-gray-100 dark:bg-gray-900 text-gray-800 dark:text-gray-200 font-sans">
+      <div className="w-full max-w-2xl bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-6 sm:p-8 space-y-8">
+        
+        {/* Header */}
+        <div className="text-center space-y-2">
+          <h1 className="text-3xl sm:text-4xl font-extrabold text-blue-600 dark:text-blue-400">
+            Pet Feed Checker
+          </h1>
+          <p className="text-gray-500 dark:text-gray-400 text-sm sm:text-base">
+            Your shared dashboard for the <span className="font-bold text-gray-500 dark:text-gray-400">"{appId}"</span> group.
+          </p>
+          
+          {/* User Name Section */}
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-2 mt-4">
+            <span className="text-sm text-gray-400 dark:text-gray-500">Hi,</span>
+            <input
+              type="text"
+              value={newUserName}
+              onChange={(e) => setNewUserName(e.target.value)}
+              placeholder="Your Name"
+              className="flex-grow max-w-xs text-center p-2 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <button
+              onClick={handleSetUserName}
+              className="p-2 rounded-xl font-bold text-white transition-transform transform hover:scale-105 active:scale-95 duration-200 text-sm"
+              style={{
+                background: 'linear-gradient(135deg, #10B981, #059669)',
+                boxShadow: '0 4px 15px rgba(16, 185, 129, 0.4)'
+              }}
+            >
+              Set Name
+            </button>
+          </div>
+        </div>
+        
+        <hr className="border-t border-gray-300 dark:border-gray-600 my-4" />
+
+        {/* Pet Selection & Add Pet Section */}
+        <div className="bg-gray-50 dark:bg-gray-700 p-5 rounded-xl shadow-inner text-center">
+          <h2 className="text-xl font-bold mb-3">Select a Pet</h2>
+          <div className="flex flex-wrap justify-center gap-2 mb-4">
+            {pets.map(pet => (
+              <button
+                key={pet.id}
+                onClick={() => setSelectedPetId(pet.id)}
+                className={`p-3 rounded-xl font-semibold transition-colors duration-200 ${selectedPetId === pet.id ? 'bg-blue-500 text-white shadow-lg' : 'bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 hover:bg-blue-200 dark:hover:bg-blue-500'}`}
+              >
+                {pet.name}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-4 mt-4">
+            <input
+              type="text"
+              value={newPetName}
+              onChange={(e) => setNewPetName(e.target.value)}
+              placeholder="Add New Pet"
+              className="flex-grow p-3 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <button
+              onClick={handleAddPet}
+              className="p-3 rounded-xl font-bold text-white transition-transform transform hover:scale-105 active:scale-95 duration-200"
+              style={{
+                background: 'linear-gradient(135deg, #FF6B6B, #F85A5A)',
+                boxShadow: '0 4px 15px rgba(255, 107, 107, 0.4)'
+              }}
+            >
+              Add Pet
+            </button>
+          </div>
+        </div>
+
+        {/* Pet Fed Status Section */}
+        <div className="bg-gray-50 dark:bg-gray-700 p-5 rounded-xl shadow-inner">
+          <h2 className="text-2xl font-bold mb-3 text-center">
+            {selectedPetId ? `${selectedPetId}'s Status` : 'No Pet Selected'}
+          </h2>
+          <div className="text-center mb-4">
+            {lastFedInfo ? (
+              <p className="text-lg font-medium text-gray-600 dark:text-gray-300">
+                Last fed by <span className="font-bold text-blue-600 dark:text-blue-400">{lastFedInfo.feederName}</span> at <span className="font-bold">{formatTimestamp(lastFedInfo.timestamp)}</span>.
+              </p>
+            ) : (
+              <p className="text-lg font-medium text-gray-500 dark:text-gray-400">Pet has not been fed yet.</p>
+            )}
+          </div>
+          <button
+            onClick={handlePetFed}
+            disabled={!selectedPetId}
+            className={`w-full p-4 rounded-xl font-bold text-lg text-white transition-transform transform hover:scale-105 active:scale-95 duration-200 ${!selectedPetId ? 'opacity-50 cursor-not-allowed' : ''}`}
+            style={{
+              background: 'linear-gradient(135deg, #10B981, #059669)',
+              boxShadow: '0 4px 15px rgba(16, 185, 129, 0.4)'
+            }}
+          >
+            I Fed {selectedPetId || 'the Pet'}!
+          </button>
+        </div>
+
+        {/* Reminders Section */}
+        <div className="bg-gray-50 dark:bg-gray-700 p-5 rounded-xl shadow-inner">
+          <h2 className="text-2xl font-bold mb-4 text-center">Reminders</h2>
+          <div className="space-y-3 mb-6">
+            {reminders.length > 0 ? (
+              reminders.map((reminder) => (
+                <div key={reminder.id} className="flex items-center justify-between bg-white dark:bg-gray-800 p-4 rounded-xl shadow-md">
+                  <span className="text-lg font-semibold">{reminder.time}</span>
+                </div>
+              ))
+            ) : (
+              <p className="text-center text-gray-500 dark:text-gray-400">No reminders set yet. Add one below!</p>
+            )}
+          </div>
+          
+          <div className="flex flex-col sm:flex-row gap-4">
+            <input
+              type="time"
+              value={newReminderTime}
+              onChange={(e) => setNewReminderTime(e.target.value)}
+              disabled={!selectedPetId}
+              className="flex-grow p-3 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+            />
+            <button
+              onClick={handleAddReminder}
+              disabled={!selectedPetId}
+              className={`p-3 rounded-xl font-bold text-white transition-transform transform hover:scale-105 active:scale-95 duration-200 ${!selectedPetId ? 'opacity-50 cursor-not-allowed' : ''}`}
+              style={{
+                background: 'linear-gradient(135deg, #3B82F6, #2563EB)',
+                boxShadow: '0 4px 15px rgba(59, 130, 246, 0.4)'
+              }}
+            >
+              Add Reminder
+            </button>
+          </div>
+        </div>
+
+        {/* Feeding Calendar Section */}
+        <div className="bg-gray-50 dark:bg-gray-700 p-5 rounded-xl shadow-inner">
+          <h2 className="text-2xl font-bold mb-4 text-center">
+            {selectedPetId ? `${selectedPetId}'s Calendar` : 'Calendar'}
+          </h2>
+          <div className="grid grid-cols-7 text-center text-sm font-semibold text-gray-500 dark:text-gray-400 mb-2">
+            <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
+          </div>
+          <div className="grid grid-cols-7 gap-1">
+            {calendarDays.map((day, index) => (
+              <div 
+                key={index} 
+                className={`flex items-center justify-center p-2 rounded-lg aspect-square font-bold 
+                  ${day.day ? 'bg-white dark:bg-gray-800' : 'bg-transparent'}
+                  ${day.fed ? 'bg-green-300 dark:bg-green-600' : ''}
+                  ${day.day === today.getDate() && month === today.getMonth() && year === today.getFullYear() ? 'ring-2 ring-blue-500 dark:ring-blue-400' : ''}`}
+              >
+                {day.day}
+              </div>
+            ))}
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+};
+
+export default App;
